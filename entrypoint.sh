@@ -62,7 +62,7 @@ PYEOF
 fi
 
 # ── Print info ──
-TLS_SECRET="ee${SECRET}$(echo -n "${TLS_DOMAIN}" | xxd -p | tr -d '\n')"
+TLS_SECRET="ee${SECRET}$(python3 -c "print('${TLS_DOMAIN}'.encode().hex())")"
 
 echo "══════════════════════════════════════════"
 echo "  MTProxy Patched — Docker"
