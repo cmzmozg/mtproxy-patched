@@ -113,7 +113,7 @@ EOF
 
 ufw allow ${PORT}/tcp 2>/dev/null
 cd /opt/mtproxy && docker compose up -d
-sleep 3
+sleep 5
 IP=$(curl -4 -s ifconfig.me)
 docker logs mtproxy 2>&1 | grep "tg://proxy" | grep "${IP}" | head -1
 ```
@@ -137,7 +137,7 @@ EOF
 
 ufw allow ${PORT}/tcp 2>/dev/null
 cd /opt/mtproxy && docker compose up -d
-sleep 3
+sleep 5
 IP=$(curl -4 -s ifconfig.me)
 docker logs mtproxy 2>&1 | grep "tg://proxy" | grep "${IP}" | head -1
 ```
