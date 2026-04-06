@@ -3,7 +3,7 @@ set -e
 
 # ── Defaults ──
 PORT="${MT_PORT:-853}"
-TLS_DOMAIN="${MT_TLS_DOMAIN:-vkvideo.ru}"
+TLS_DOMAIN="${MT_TLS_DOMAIN:-habr.com}"
 SOCKS5_HOST="${MT_SOCKS5_HOST:-}"
 SOCKS5_PORT="${MT_SOCKS5_PORT:-}"
 CDN_IP="${MT_CDN_IP:-91.105.192.100}"

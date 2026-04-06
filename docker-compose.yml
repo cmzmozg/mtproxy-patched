@@ -7,7 +7,7 @@ services:
     environment:
       - MT_PORT=${MT_PORT:-853}
       - MT_SECRET=${MT_SECRET:-auto}
-      - MT_TLS_DOMAIN=${MT_TLS_DOMAIN:-vkvideo.ru}
+      - MT_TLS_DOMAIN=${MT_TLS_DOMAIN:-habr.com}
       - MT_CDN_IP=${MT_CDN_IP:-91.105.192.100}
       - MT_SOCKS5_HOST=${MT_SOCKS5_HOST:-127.0.0.1}
       - MT_SOCKS5_PORT=${MT_SOCKS5_PORT:-1080}

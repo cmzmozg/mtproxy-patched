@@ -5,7 +5,7 @@
 # Переменные окружения (опционально):
 #   MT_PORT        (default: 853)
 #   MT_SECRET      (default: auto)
-#   MT_TLS_DOMAIN  (default: vkvideo.ru)
+#   MT_TLS_DOMAIN  (default: habr.com)
 #   MT_CDN_IP      (default: 91.105.192.100)
 #   MT_SOCKS5_HOST (default: none — директ-режим)
 #   MT_SOCKS5_PORT (default: none)
@@ -22,7 +22,7 @@ fail() { echo -e "${RED}[FAIL]${NC} $*"; exit 1; }
 
 # ── Параметры ────────────────────────────────────────────────────────────────
 PORT="${1:-${MT_PORT:-853}}"
-TLS_DOMAIN="${2:-${MT_TLS_DOMAIN:-vkvideo.ru}}"
+TLS_DOMAIN="${2:-${MT_TLS_DOMAIN:-habr.com}}"
 SECRET="${MT_SECRET:-auto}"
 CDN_IP="${MT_CDN_IP:-91.105.192.100}"
 SOCKS5_HOST="${MT_SOCKS5_HOST:-}"

@@ -14,7 +14,7 @@ fail() { echo -e "${RED}[FAIL]${NC} $*"; exit 1; }
 
 # ── Параметры ────────────────────────────────────────────────────────────────
 PORT="${1:-${MT_PORT:-853}}"
-TLS_DOMAIN="${2:-${MT_TLS_DOMAIN:-vkvideo.ru}}"
+TLS_DOMAIN="${2:-${MT_TLS_DOMAIN:-habr.com}}"
 SECRET="${MT_SECRET:-auto}"
 CDN_IP="${MT_CDN_IP:-91.105.192.100}"
 POOL_SIZE="${MT_POOL_SIZE:-5}"
