@@ -118,6 +118,11 @@ IP=$(curl -4 -s ifconfig.me)
 docker logs mtproxy 2>&1 | grep "tg://proxy" | grep "${IP}" | head -1
 ```
 
+> Если ссылка не вывелась — контейнер ещё стартует. Подождите и выполните:
+> ```bash
+> docker logs mtproxy 2>&1 | grep "tg://proxy"
+> ```
+
 **Директ (без SOCKS5):**
 
 ```bash
@@ -141,6 +146,11 @@ sleep 5
 IP=$(curl -4 -s ifconfig.me)
 docker logs mtproxy 2>&1 | grep "tg://proxy" | grep "${IP}" | head -1
 ```
+
+> Если ссылка не вывелась — контейнер ещё стартует. Подождите и выполните:
+> ```bash
+> docker logs mtproxy 2>&1 | grep "tg://proxy"
+> ```
 
 **Управление:**
 
