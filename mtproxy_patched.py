@@ -104,6 +104,13 @@ disable_middle_proxy = False
 is_time_skewed = False
 fake_cert_len = random.randrange(1024, 4096)
 mask_host_cached_ip = None
+# ── MOD: Профиль ServerHello реального mask-хоста. Снимается периодически,
+# используется в handle_fake_tls_handshake для реплики. Вариант B FakeTLS:
+# наш ServerHello структурно совпадает с настоящим vkvideo.ru (или что в
+# MASK_HOST) — cipher_suite и extensions копируются. Пассивный DPI, сравнивающий
+# ServerHello с эталоном, не видит разницы с реальным трафиком.
+# Структура: {"cipher_suite": b"\x13\x01", "extensions_raw": b"...", "version": b"\x03\x03"}
+mask_host_tls_profile = None
 last_clients_with_time_skew = {}
 last_clients_with_same_handshake = collections.Counter()
 proxy_start_time = 0
@@ -205,7 +212,8 @@ def init_config():
     # ── MOD: Health check и pool настройки ──
     conf_dict.setdefault("HEALTH_CHECK_INTERVAL", 30)
     conf_dict.setdefault("HEALTH_CHECK_MAX_LATENCY", 3.0)
-    conf_dict.setdefault("POOL_SIZE", 5)
+    conf_dict.setdefault("POOL_SIZE", 2)
+    conf_dict.setdefault("POOL_CONN_TTL", 60)
 
     # ── MOD: Маппинг CDN DC → IP адреса ──
     # CDN IP получается из getConfig Telegram (у каждого юзера/региона свой).
@@ -502,13 +510,22 @@ myrandom = MyRandom()
 
 
 class TgConnectionPool:
-    # ── MOD: Размер пула берётся из конфига (default 5 вместо 2) ──
+    # ── MOD: Размер пула берётся из конфига (default 2 — снижаем fingerprint
+    # от 5 параллельных preconnect-сессий, которые бросаются в глаза DPI ──
+    # ── MOD: TTL на preconnect'ы — закрываем соединения, которые висят
+    # неиспользованными дольше POOL_CONN_TTL секунд. Без этого зомби-connect
+    # к Telegram DC живут часами и светятся как "молчащие TLS" на DPI. ──
     def __init__(self):
+        # pools[(host, port, init_func)] = list of (task, created_at)
         self.pools = {}
 
     @property
     def max_conns(self):
-        return getattr(config, 'POOL_SIZE', 5)
+        return getattr(config, 'POOL_SIZE', 2)
+
+    @property
+    def conn_ttl(self):
+        return getattr(config, 'POOL_CONN_TTL', 60)
 
     async def open_tg_connection(self, host, port, init_func=None):
         if config.SOCKS5_HOST and config.SOCKS5_PORT:
@@ -541,30 +558,54 @@ class TgConnectionPool:
             return True
         return False
 
+    def _prune_expired(self, key):
+        """Закрывает и удаляет preconnect'ы, завершённые но не забранные
+        клиентами дольше conn_ttl секунд. Open task'и (ещё не done) не трогаем —
+        они могут быть в процессе SOCKS5-handshake."""
+        ttl = self.conn_ttl
+        now = time.monotonic()
+        survivors = []
+        for task, created_at in self.pools[key]:
+            if task.done() and not task.cancelled() and not task.exception():
+                if now - created_at > ttl:
+                    try:
+                        reader, writer, *_ = task.result()
+                        writer.transport.abort()
+                        dbg(f"[POOL] expired preconnect to {key[0]}:{key[1]} (age {now - created_at:.0f}s)")
+                    except Exception:
+                        pass
+                    continue
+            survivors.append((task, created_at))
+        self.pools[key] = survivors
+
     def register_host_port(self, host, port, init_func):
-        if (host, port, init_func) not in self.pools:
-            self.pools[(host, port, init_func)] = []
+        key = (host, port, init_func)
+        if key not in self.pools:
+            self.pools[key] = []
+        else:
+            self._prune_expired(key)
         # ── MOD: Preconnect ВКЛЮЧЁН для SOCKS5 — asyncio реализация не блокирует event loop ──
-        # Старое ограничение (PySocks блокировал) больше не актуально
-        while len(self.pools[(host, port, init_func)]) < self.max_conns:
+        while len(self.pools[key]) < self.max_conns:
             connect_task = asyncio.ensure_future(self.open_tg_connection(host, port, init_func))
-            self.pools[(host, port, init_func)].append(connect_task)
+            self.pools[key].append((connect_task, time.monotonic()))
 
     async def get_connection(self, host, port, init_func=None):
+        key = (host, port, init_func)
         self.register_host_port(host, port, init_func)
         ret = None
-        for task in self.pools[(host, port, init_func)][:]:
+        for entry in self.pools[key][:]:
+            task, created_at = entry
             if task.done():
                 if task.exception():
-                    self.pools[(host, port, init_func)].remove(task)
+                    self.pools[key].remove(entry)
                     continue
                 reader, writer, *other = task.result()
                 if self.is_conn_dead(reader, writer):
-                    self.pools[(host, port, init_func)].remove(task)
+                    self.pools[key].remove(entry)
                     writer.transport.abort()
                     continue
                 if not ret:
-                    self.pools[(host, port, init_func)].remove(task)
+                    self.pools[key].remove(entry)
                     ret = (reader, writer, *other)
         self.register_host_port(host, port, init_func)
         if ret:
@@ -998,9 +1039,12 @@ def set_instant_rst(sock):
 
 
 def gen_x25519_public_key():
-    P = 2**255 - 19
-    n = myrandom.randrange(P)
-    return int.to_bytes((n*n) % P, length=32, byteorder="little")
+    # ── MOD: 32 случайных байта — валидный x25519 public key.
+    # Старая версия считала n*n mod P, что не гарантирует точку на кривой
+    # Montgomery и может палиться строгими DPI-проверками валидности key_share.
+    # Любые 32 байта принимаются реальными TLS 1.3 реализациями (clamping
+    # выполняется получателем), что делает нас неотличимыми от реального Chrome.
+    return myrandom.getrandbytes(32)
 
 
 # =============================================================================
@@ -1251,7 +1295,12 @@ def gen_tls_client_hello_msg(server_name):
 
 async def connect_reader_to_writer(reader, writer):
     # ── MOD: 64KB вместо 8KB — снижает количество syscalls для медиа-трафика ──
+    # ── MOD: батчинг drain'а — раньше drain вызывался на каждый write,
+    # что убивало throughput при активной передаче (один syscall на каждые 64KB).
+    # Теперь drain каждые 4 write'а или при переполнении write-буфера ──
     BUF_SIZE = 65536
+    DRAIN_EVERY = 4
+    itr = 0
     try:
         while True:
             data = await reader.read(BUF_SIZE)
@@ -1261,7 +1310,11 @@ async def connect_reader_to_writer(reader, writer):
                     await writer.drain()
                 return
             writer.write(data)
-            await writer.drain()
+            itr += 1
+            buf_size = writer.transport.get_write_buffer_size()
+            if itr >= DRAIN_EVERY or buf_size > BUF_SIZE * 8:
+                await writer.drain()
+                itr = 0
     except (OSError, asyncio.IncompleteReadError) as e:
         pass
 
@@ -1325,6 +1378,108 @@ async def handle_bad_client(reader_clt, writer_clt, handshake):
             writer_srv.transport.abort()
 
 
+def _rewrite_key_share(extensions_raw):
+    """Находит key_share extension (тип 0x0033) в наборе TLS extensions и заменяет
+    x25519 public key (group 0x001d) на свежий. Нужно, чтобы наш ServerHello,
+    собранный по профилю реального mask-хоста, не имел идентичного key_share
+    для всех клиентов (иначе сам key_share становится fingerprint'ом).
+
+    Если key_share не найден или парсинг не удался — возвращаем исходные байты
+    без изменений (безопаснее, чем ничего).
+
+    Формат key_share в ServerHello (RFC 8446 §4.2.8):
+    ext_type (0x0033) + ext_len (2) + KeyShareEntry{
+        group (2) + key_exchange_len (2) + key_exchange (var)
+    }
+    """
+    try:
+        data = extensions_raw
+        out = bytearray()
+        i = 0
+        n = len(data)
+        while i + 4 <= n:
+            ext_type = data[i:i+2]
+            ext_len = int.from_bytes(data[i+2:i+4], "big")
+            if i + 4 + ext_len > n:
+                # Мусор в хвосте, не портим
+                out += data[i:]
+                return bytes(out)
+
+            ext_body = data[i+4:i+4+ext_len]
+
+            if ext_type == b"\x00\x33" and ext_len >= 4:
+                # KeyShareEntry: group(2) + key_exchange_len(2) + key_exchange
+                group = ext_body[0:2]
+                ke_len = int.from_bytes(ext_body[2:4], "big")
+                if group == b"\x00\x1d" and ke_len == 32 and len(ext_body) >= 4 + 32:
+                    # Заменяем 32 байта x25519 key на свежий
+                    new_body = ext_body[:4] + gen_x25519_public_key() + ext_body[4+32:]
+                    out += ext_type
+                    out += len(new_body).to_bytes(2, "big")
+                    out += new_body
+                    i += 4 + ext_len
+                    continue
+
+            out += data[i:i+4+ext_len]
+            i += 4 + ext_len
+
+        return bytes(out)
+    except Exception:
+        return extensions_raw
+
+
+def parse_server_hello(record):
+    """Парсит TLS ServerHello record (тип 0x16, handshake type 0x02) и извлекает
+    структурные параметры — cipher_suite и extensions — чтобы их потом можно было
+    воспроизвести в нашем FakeTLS ServerHello.
+
+    Вход: байты TLS record (без заголовка record-layer 5 байт).
+    Возвращает dict или None если парсинг не удался.
+
+    Формат ServerHello (RFC 8446):
+    struct {
+        ProtocolVersion legacy_version;   // 2 bytes, 0x0303
+        Random random;                    // 32 bytes
+        opaque legacy_session_id_echo<0..32>;
+        CipherSuite cipher_suite;         // 2 bytes
+        uint8 legacy_compression_method;  // 1 byte
+        Extension extensions<6..2^16-1>;
+    };
+    Перед этим — handshake header: 1 байт type (0x02) + 3 байта length.
+    """
+    try:
+        if len(record) < 4:
+            return None
+        if record[0] != 0x02:  # handshake type: server_hello
+            return None
+        body_len = int.from_bytes(record[1:4], "big")
+        body = record[4:4+body_len]
+        if len(body) < 34:
+            return None
+        version = body[0:2]
+        # random = body[2:34] — не нужен, это рандом сервера
+        sess_id_len = body[34]
+        if len(body) < 35 + sess_id_len + 2 + 1 + 2:
+            return None
+        offset = 35 + sess_id_len
+        cipher_suite = body[offset:offset+2]
+        offset += 2
+        # compression_method = body[offset]
+        offset += 1
+        exts_len = int.from_bytes(body[offset:offset+2], "big")
+        offset += 2
+        extensions_raw = body[offset:offset+exts_len]
+        if len(extensions_raw) != exts_len:
+            return None
+        return {
+            "version": bytes(version),
+            "cipher_suite": bytes(cipher_suite),
+            "extensions_raw": bytes(extensions_raw),
+        }
+    except Exception:
+        return None
+
+
 async def handle_fake_tls_handshake(handshake, reader, writer, peer):
     global used_handshakes
     global client_ips
@@ -1337,7 +1492,6 @@ async def handle_fake_tls_handshake(handshake, reader, writer, peer):
     TIME_SKEW_MAX = 10 * 60
 
     TLS_VERS = b"\x03\x03"
-    TLS_CIPHERSUITE = b"\x13\x01"
     TLS_CHANGE_CIPHER = b"\x14" + TLS_VERS + b"\x00\x01\x01"
     TLS_APP_HTTP2_HDR = b"\x17" + TLS_VERS
 
@@ -1348,8 +1502,20 @@ async def handle_fake_tls_handshake(handshake, reader, writer, peer):
     SESSION_ID_LEN_POS = DIGEST_POS + DIGEST_LEN
     SESSION_ID_POS = SESSION_ID_LEN_POS + 1
 
-    tls_extensions = b"\x00\x2e" + b"\x00\x33\x00\x24" + b"\x00\x1d\x00\x20"
-    tls_extensions += gen_x25519_public_key() + b"\x00\x2b\x00\x02\x03\x04"
+    # ── MOD: Используем снятый профиль mask-хоста, если он есть.
+    # Это вариант B FakeTLS: наш ServerHello структурно совпадает с реальным
+    # vkvideo.ru / habr.com и т.д. Пассивный DPI не видит разницы. ──
+    if mask_host_tls_profile is not None:
+        TLS_CIPHERSUITE = mask_host_tls_profile["cipher_suite"]
+        # Копируем extensions реального сервера, но заменяем key_share на
+        # наш свежий x25519 key (иначе все наши ServerHello имели бы
+        # идентичный key_share — сами по себе fingerprint).
+        tls_extensions = _rewrite_key_share(mask_host_tls_profile["extensions_raw"])
+    else:
+        # Fallback: старое фиксированное поведение (backward compat).
+        TLS_CIPHERSUITE = b"\x13\x01"
+        tls_extensions = b"\x00\x2e" + b"\x00\x33\x00\x24" + b"\x00\x1d\x00\x20"
+        tls_extensions += gen_x25519_public_key() + b"\x00\x2b\x00\x02\x03\x04"
 
     digest = handshake[DIGEST_POS:DIGEST_POS+DIGEST_LEN]
 
@@ -1379,7 +1545,14 @@ async def handle_fake_tls_handshake(handshake, reader, writer, peer):
             last_clients_with_time_skew[peer[0]] = (time.time() - timestamp) // 60
             continue
 
-        http_data = myrandom.getrandbytes(fake_cert_len)
+        # ── MOD: Jitter вокруг реального размера сертификата mask-хоста.
+        # fake_cert_len периодически обновляется из get_mask_host_cert_len,
+        # но если возвращать всем клиентам одинаковое значение — это
+        # fingerprint инстанса. Добавляем ±5% вариацию, что укладывается
+        # в нормальный разброс TLS record framing у реальных серверов.
+        jitter = myrandom.randrange(-fake_cert_len // 20, fake_cert_len // 20 + 1)
+        cert_len_this_session = max(MIN_CERT_LEN, fake_cert_len + jitter)
+        http_data = myrandom.getrandbytes(cert_len_this_session)
 
         srv_hello = TLS_VERS + b"\x00"*DIGEST_LEN + bytes([sess_id_len]) + sess_id
         srv_hello += TLS_CIPHERSUITE + b"\x00" + tls_extensions
@@ -2241,8 +2414,61 @@ async def get_encrypted_cert(host, port, server_name):
     return record3
 
 
+async def get_encrypted_cert_and_profile(host, port, server_name):
+    """Вариант get_encrypted_cert, дополнительно парсящий ServerHello
+    и возвращающий TLS-профиль для использования в FakeTLS replica.
+
+    Возвращает tuple (cert_bytes, profile_dict_or_None).
+    """
+    async def get_tls_record(reader):
+        try:
+            record_type = (await reader.readexactly(1))[0]
+            tls_version = await reader.readexactly(2)
+            if tls_version != b"\x03\x03":
+                return 0, b""
+            record_len = int.from_bytes(await reader.readexactly(2), "big")
+            record = await reader.readexactly(record_len)
+            return record_type, record
+        except asyncio.IncompleteReadError:
+            return 0, b""
+
+    reader, writer = await asyncio.open_connection(host, port)
+    try:
+        writer.write(gen_tls_client_hello_msg(server_name))
+        await writer.drain()
+
+        # Record 1: handshake (ServerHello) — из него снимаем профиль
+        record1_type, record1 = await get_tls_record(reader)
+        if record1_type != 22:
+            return b"", None
+
+        profile = parse_server_hello(record1)
+
+        record2_type, record2 = await get_tls_record(reader)
+        if record2_type != 20:
+            return b"", profile
+
+        record3_type, record3 = await get_tls_record(reader)
+        if record3_type != 23:
+            return b"", profile
+
+        if len(record3) < MIN_CERT_LEN:
+            record4_type, record4 = await get_tls_record(reader)
+            if record4_type != 23:
+                return b"", profile
+            return record4, profile
+
+        return record3, profile
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
 async def get_mask_host_cert_len():
     global fake_cert_len
+    global mask_host_tls_profile
 
     GET_CERT_TIMEOUT = 10
     MASK_ENABLING_CHECK_PERIOD = 60
@@ -2253,8 +2479,19 @@ async def get_mask_host_cert_len():
                 await asyncio.sleep(MASK_ENABLING_CHECK_PERIOD)
                 continue
 
-            task = get_encrypted_cert(config.MASK_HOST, config.MASK_PORT, config.TLS_DOMAIN)
-            cert = await asyncio.wait_for(task, timeout=GET_CERT_TIMEOUT)
+            # ── MOD: Одновременно снимаем профиль ServerHello для FakeTLS replica ──
+            task = get_encrypted_cert_and_profile(config.MASK_HOST, config.MASK_PORT, config.TLS_DOMAIN)
+            cert, profile = await asyncio.wait_for(task, timeout=GET_CERT_TIMEOUT)
+
+            if profile is not None:
+                if mask_host_tls_profile != profile:
+                    mask_host_tls_profile = profile
+                    print_err("Got ServerHello profile from MASK_HOST %s: "
+                              "cipher=%s, exts_len=%d" % (
+                              config.MASK_HOST,
+                              profile["cipher_suite"].hex(),
+                              len(profile["extensions_raw"])))
+
             if cert:
                 if len(cert) < MIN_CERT_LEN:
                     msg = ("The MASK_HOST %s returned several TLS records, this is not supported" %
@@ -2619,7 +2856,12 @@ def create_utilitary_tasks(loop):
 # ── MOD: SOCKS5 Health Checker ──────────────────────────────────────────────
 async def socks5_health_checker():
     """Периодически проверяет latency через SOCKS5 → Telegram DC.
-    При деградации чистит connection pool, вынуждая создать свежие соединения."""
+    При деградации чистит connection pool, вынуждая создать свежие соединения.
+
+    ── MOD: Триггер очистки пула только при 2+ подряд срабатываниях (замедления
+    или таймауты). Одиночный сетевой jitter больше не ломает всем пользователям
+    пул. Тестовый DC ротируется по DC1-DC5, чтобы не зависеть от одного IP. ──
+    """
     global tg_connection_pool
 
     # Ждём пока конфиг полностью инициализируется
@@ -2628,21 +2870,31 @@ async def socks5_health_checker():
     check_interval = getattr(config, 'HEALTH_CHECK_INTERVAL', 30)
     max_latency = getattr(config, 'HEALTH_CHECK_MAX_LATENCY', 3.0)
 
-    # DC2 — самый популярный, хороший индикатор
-    TEST_HOST = "149.154.167.51"
+    # Ротируем между DC1-DC5 — избегаем ложных срабатываний при проблемах
+    # с одним конкретным IP. TG_DATACENTERS_V4[0..4] — рабочие DC.
+    TEST_HOSTS = TG_DATACENTERS_V4[:5]
     TEST_PORT = 443
+    test_idx = 0
 
-    consecutive_failures = 0
+    consecutive_failures = 0       # подряд полные фейлы (timeout/exception)
+    consecutive_slow = 0           # подряд превышения soft-порога
     last_latency = 0.0
+    SOFT_SLOW_THRESHOLD = 0.7      # коэффициент от max_latency для "медленно"
+    SLOW_HYSTERESIS = 2            # сколько подряд "медленно" до clear
+    FAIL_HYSTERESIS = 2            # сколько подряд fail до clear
 
     while True:
         await asyncio.sleep(check_interval)
         if not (config.SOCKS5_HOST and config.SOCKS5_PORT):
             continue
+
+        test_host = TEST_HOSTS[test_idx % len(TEST_HOSTS)]
+        test_idx += 1
+
         try:
             t0 = time.monotonic()
             r, w = await asyncio.wait_for(
-                _socks5_connect(TEST_HOST, TEST_PORT,
+                _socks5_connect(test_host, TEST_PORT,
                                 config.SOCKS5_HOST, config.SOCKS5_PORT,
                                 config.SOCKS5_USER, config.SOCKS5_PASS),
                 timeout=max_latency
@@ -2652,19 +2904,33 @@ async def socks5_health_checker():
 
             consecutive_failures = 0
 
-            # Логируем если задержка заметно выросла
-            if latency > max_latency * 0.7:
-                print_err(f"[HEALTH] SOCKS5 latency {latency:.2f}s (threshold {max_latency:.1f}s) — clearing pool")
-                tg_connection_pool.pools.clear()
-            elif DEBUG_MODE or (last_latency > 0 and latency > last_latency * 2):
-                dbg(f"[HEALTH] SOCKS5 latency {latency:.3f}s (prev {last_latency:.3f}s)")
+            # Soft slow — требует подтверждения подряд, иначе это шум
+            if latency > max_latency * SOFT_SLOW_THRESHOLD:
+                consecutive_slow += 1
+                if consecutive_slow >= SLOW_HYSTERESIS:
+                    print_err(f"[HEALTH] SOCKS5 slow {latency:.2f}s to {test_host} "
+                              f"({consecutive_slow} in a row, threshold {max_latency:.1f}s) — clearing pool")
+                    tg_connection_pool.pools.clear()
+                    consecutive_slow = 0
+                else:
+                    dbg(f"[HEALTH] SOCKS5 slow {latency:.2f}s to {test_host} (#{consecutive_slow}, waiting for hysteresis)")
+            else:
+                consecutive_slow = 0
+                if DEBUG_MODE or (last_latency > 0 and latency > last_latency * 2):
+                    dbg(f"[HEALTH] SOCKS5 latency {latency:.3f}s to {test_host} (prev {last_latency:.3f}s)")
 
             last_latency = latency
 
         except asyncio.TimeoutError:
             consecutive_failures += 1
-            print_err(f"[HEALTH] SOCKS5 timeout (>{max_latency:.1f}s) — fail #{consecutive_failures}, clearing pool")
-            tg_connection_pool.pools.clear()
+            consecutive_slow = 0
+            if consecutive_failures >= FAIL_HYSTERESIS:
+                print_err(f"[HEALTH] SOCKS5 timeout to {test_host} (>{max_latency:.1f}s) "
+                          f"— fail #{consecutive_failures}, clearing pool")
+                tg_connection_pool.pools.clear()
+            else:
+                print_err(f"[HEALTH] SOCKS5 timeout to {test_host} — fail #{consecutive_failures} "
+                          f"(waiting for hysteresis, pool intact)")
 
             # При 3+ подряд таймаутах — пробуем backup если есть
             if consecutive_failures >= 3 and config.SOCKS5_HOST_BACKUP:
@@ -2673,8 +2939,14 @@ async def socks5_health_checker():
 
         except Exception as e:
             consecutive_failures += 1
-            print_err(f"[HEALTH] SOCKS5 check failed: {e} — fail #{consecutive_failures}, clearing pool")
-            tg_connection_pool.pools.clear()
+            consecutive_slow = 0
+            if consecutive_failures >= FAIL_HYSTERESIS:
+                print_err(f"[HEALTH] SOCKS5 check to {test_host} failed: {e} "
+                          f"— fail #{consecutive_failures}, clearing pool")
+                tg_connection_pool.pools.clear()
+            else:
+                print_err(f"[HEALTH] SOCKS5 check to {test_host} failed: {e} "
+                          f"— fail #{consecutive_failures} (waiting for hysteresis, pool intact)")
 
 
 def main():
